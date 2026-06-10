@@ -1,0 +1,79 @@
+name: Destroy — gitlabeks48data
+
+on:
+  workflow_dispatch:
+
+jobs:
+  destroy:
+    name: Destroy EKS (kubectl + Terraform)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.31.0'
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.15.0'
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Resolve cluster name from state
+        id: cluster
+        working-directory: terraform
+        run: |
+          CLUSTER=$(terraform output -raw cluster_name 2>/dev/null || \
+            echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//' \
+              | cut -c1-24 \
+              | sed 's/-$//')
+          echo "name=${CLUSTER}-eks" >> $GITHUB_OUTPUT || echo "name=${CLUSTER}" >> $GITHUB_OUTPUT
+      - name: Update kubeconfig (best-effort)
+        run: |
+          aws eks update-kubeconfig \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${{ steps.cluster.outputs.name }}" 2>/dev/null \
+            || echo "Cluster not reachable — continuing with destroy"
+      - name: Delete Kubernetes resources before Terraform destroy
+        run: |
+          NAMESPACE=$(cd terraform && terraform output -raw namespace 2>/dev/null || \
+            echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//' \
+              | cut -c1-24 \
+              | sed 's/-$//') || true
+          # Remove ingress first so ALB is deprovisioned before VPC destroy
+          kubectl delete ingress --all -n "$NAMESPACE" --ignore-not-found || true
+          kubectl delete service --all -n "$NAMESPACE" --ignore-not-found || true
+          helm uninstall aws-load-balancer-controller -n kube-system 2>/dev/null || true
+          # Wait briefly for ALB to be deprovisioned
+          sleep 30
+      - name: Terraform destroy
+        working-directory: terraform
+        env:
+          TF_VAR_node_instance_type: ${{ secrets.NODE_INSTANCE_TYPE }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="container_image=placeholder"

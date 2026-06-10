@@ -1,0 +1,464 @@
+name: Deploy — gitlabeks48data
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm test --if-present
+
+  build_push:
+    name: Build & Push Docker Image to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Login to ECR
+        id: login_ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Resolve image tag
+        id: meta
+        run: |
+          ECR_REGISTRY="${{ steps.login_ecr.outputs.registry }}"
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          IMAGE="${ECR_REGISTRY}/${PROJECT_NAME}:${{ github.sha }}"
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "project_lower=${PROJECT_NAME}" >> $GITHUB_OUTPUT
+          echo "Built image: ${IMAGE}"
+      - name: Ensure ECR repository exists
+        run: |
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          if aws ecr describe-repositories \
+               --repository-names "${PROJECT_NAME}" \
+               --region "${{ secrets.AWS_REGION }}" > /dev/null 2>&1; then
+            echo "ECR repo '${PROJECT_NAME}' already exists"
+          else
+            echo "Creating ECR repo '${PROJECT_NAME}'..."
+            aws ecr create-repository \
+              --repository-name "${PROJECT_NAME}" \
+              --image-tag-mutability MUTABLE \
+              --region "${{ secrets.AWS_REGION }}"
+          fi
+      - name: Build & push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.image }} .
+          docker push ${{ steps.meta.outputs.image }}
+
+  provision:
+    name: Provision EKS via Terraform
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      cluster_name: ${{ steps.tf_out.outputs.cluster_name }}
+      namespace:    ${{ steps.tf_out.outputs.namespace }}
+      ecr_url:      ${{ steps.tf_out.outputs.ecr_url }}
+      app_env_json: ${{ steps.tf_out.outputs.app_env_json }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Create S3 state bucket
+        run: |
+          aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} \
+            --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+          aws s3api put-bucket-versioning \
+            --bucket ${{ secrets.TF_STATE_BUCKET }} \
+            --versioning-configuration Status=Enabled 2>/dev/null || true
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          TF_VAR_container_image:        ${{ needs.build_push.outputs.image }}
+          TF_VAR_database_url:           ${{ secrets.DATABASE_URL }}
+          TF_VAR_db_host:                ${{ secrets.DB_HOST }}
+          TF_VAR_db_port:                ${{ secrets.DB_PORT }}
+          TF_VAR_db_name:                ${{ secrets.DB_NAME }}
+          TF_VAR_db_username:            ${{ secrets.DB_USER }}
+          TF_VAR_db_password:            ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mongo_uri:              ${{ secrets.MONGO_URI }}
+          TF_VAR_redis_url:              ${{ secrets.REDIS_URL }}
+          TF_VAR_secret_key:             ${{ secrets.SECRET_KEY }}
+          TF_VAR_jwt_secret:             ${{ secrets.JWT_SECRET }}
+          TF_VAR_spring_datasource_url:  ${{ secrets.SPRING_DATASOURCE_URL }}
+          TF_VAR_spring_datasource_user: ${{ secrets.SPRING_DATASOURCE_USERNAME }}
+          TF_VAR_spring_datasource_pass: ${{ secrets.SPRING_DATASOURCE_PASSWORD }}
+          TF_VAR_spring_mongodb_uri:     ${{ secrets.SPRING_DATA_MONGODB_URI }}
+          TF_VAR_rds_db_name:            ${{ secrets.DB_NAME }}
+          TF_VAR_rds_db_username:        ${{ secrets.DB_USER }}
+          TF_VAR_rds_db_password:        ${{ secrets.DB_PASSWORD }}
+          TF_VAR_node_instance_type:     ${{ secrets.NODE_INSTANCE_TYPE }}
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
+      - name: Capture Terraform outputs
+        id: tf_out
+        working-directory: terraform
+        run: |
+          PROJECT_SAFE=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//' \
+            | cut -c1-24 \
+            | sed 's/-$//')
+
+          CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "${PROJECT_SAFE}-eks")
+          NAMESPACE=$(terraform output -raw namespace 2>/dev/null || echo "${PROJECT_SAFE}")
+          ECR_URL=$(terraform output -raw ecr_repository_url 2>/dev/null || echo "")
+
+          APP_ENV_JSON=$(terraform output -json app_env_json 2>/dev/null \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d)" 2>/dev/null \
+            || echo "{}")
+
+          echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+          echo "namespace=${NAMESPACE}"       >> $GITHUB_OUTPUT
+          echo "ecr_url=${ECR_URL}"           >> $GITHUB_OUTPUT
+          echo "app_env_json=${APP_ENV_JSON}" >> $GITHUB_OUTPUT
+
+          echo "Cluster  : ${CLUSTER_NAME}"
+          echo "Namespace: ${NAMESPACE}"
+
+  deploy:
+    name: Deploy to EKS (kubectl + helm)
+    runs-on: ubuntu-latest
+    needs: [build_push, provision]
+    outputs:
+      url: ${{ steps.ingress.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Resolve cluster context
+        id: ctx
+        run: |
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//' \
+            | cut -c1-24 \
+            | sed 's/-$//')
+
+          CLUSTER_NAME="${{ needs.provision.outputs.cluster_name }}"
+          NAMESPACE="${{ needs.provision.outputs.namespace }}"
+          [ -z "$CLUSTER_NAME" ] && CLUSTER_NAME="${PROJECT_NAME}-eks"
+          [ -z "$NAMESPACE" ]    && NAMESPACE="${PROJECT_NAME}"
+
+          echo "PROJECT_NAME=${PROJECT_NAME}" >> $GITHUB_ENV
+          echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_ENV
+          echo "NAMESPACE=${NAMESPACE}"       >> $GITHUB_ENV
+
+          echo "Resolved — cluster: ${CLUSTER_NAME}  namespace: ${NAMESPACE}"
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.31.0'
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.15.0'
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${CLUSTER_NAME}"
+      - name: Create namespace
+        run: |
+          kubectl create namespace "${NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Create ECR pull secret
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_PASSWORD=$(aws ecr get-login-password --region "${{ secrets.AWS_REGION }}")
+          kubectl create secret docker-registry ecr-pull-secret \
+            --namespace "${NAMESPACE}" \
+            --docker-server="${ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com" \
+            --docker-username=AWS \
+            --docker-password="${ECR_PASSWORD}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Create app env secret
+        run: |
+          APP_ENV_JSON='${{ needs.provision.outputs.app_env_json }}'
+          ARGS=""
+          while IFS="=" read -r key val; do
+            ARGS="$ARGS --from-literal=${key}=${val}"
+          done < <(echo "$APP_ENV_JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for k,v in d.items():
+              if v: print(f'{k}={v}')
+          " 2>/dev/null || true)
+          if [ -n "$ARGS" ]; then
+            kubectl create secret generic "${PROJECT_NAME}-env" \
+              --namespace "${NAMESPACE}" \
+              $ARGS \
+              --dry-run=client -o yaml | kubectl apply -f -
+          fi
+      - name: Install AWS Load Balancer Controller
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          VPC_ID=$(aws eks describe-cluster \
+            --name "${CLUSTER_NAME}" \
+            --query 'cluster.resourcesVpcConfig.vpcId' \
+            --output text)
+
+          LBC_ROLE_NAME="${CLUSTER_NAME}-lbc-role"
+          OIDC_URL=$(aws eks describe-cluster \
+            --name "${CLUSTER_NAME}" \
+            --query 'cluster.identity.oidc.issuer' \
+            --output text | sed 's|https://||')
+          OIDC_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_URL}"
+
+          aws iam list-open-id-connect-providers \
+            | grep -q "${OIDC_URL}" \
+            || eksctl utils associate-iam-oidc-provider \
+                 --region "${{ secrets.AWS_REGION }}" \
+                 --cluster "${CLUSTER_NAME}" --approve 2>/dev/null \
+            || aws eks describe-cluster --name "${CLUSTER_NAME}" > /dev/null
+
+          python3 -c "import json,sys; print(json.dumps({'Version':'2012-10-17','Statement':[{'Effect':'Allow','Principal':{'Federated':sys.argv[1]},'Action':'sts:AssumeRoleWithWebIdentity','Condition':{'StringEquals':{sys.argv[2]+':sub':'system:serviceaccount:kube-system:aws-load-balancer-controller',sys.argv[2]+':aud':'sts.amazonaws.com'}}}]}))" "${OIDC_ARN}" "${OIDC_URL}" > /tmp/lbc-trust.json
+          if aws iam get-role --role-name "${LBC_ROLE_NAME}" > /dev/null 2>&1; then
+            echo "IAM role ${LBC_ROLE_NAME} already exists"
+            aws iam update-assume-role-policy \
+              --role-name "${LBC_ROLE_NAME}" \
+              --policy-document file:///tmp/lbc-trust.json
+          else
+            aws iam create-role \
+              --role-name "${LBC_ROLE_NAME}" \
+              --assume-role-policy-document file:///tmp/lbc-trust.json
+          fi
+
+          LBC_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${CLUSTER_NAME}-lbc-policy"
+          if ! aws iam get-policy --policy-arn "${LBC_POLICY_ARN}" > /dev/null 2>&1; then
+            curl -sL https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.8.1/docs/install/iam_policy.json \
+              -o /tmp/lbc-policy.json
+            aws iam create-policy \
+              --policy-name "${CLUSTER_NAME}-lbc-policy" \
+              --policy-document file:///tmp/lbc-policy.json
+          fi
+          aws iam attach-role-policy \
+            --role-name "${LBC_ROLE_NAME}" \
+            --policy-arn "${LBC_POLICY_ARN}" 2>/dev/null || true
+
+          LBC_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${LBC_ROLE_NAME}"
+          echo "LBC_ROLE_ARN=${LBC_ROLE_ARN}" >> $GITHUB_ENV
+          echo "LBC role: ${LBC_ROLE_ARN}"
+
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --set clusterName="${CLUSTER_NAME}" \
+            --set serviceAccount.create=true \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=${LBC_ROLE_ARN}" \
+            --set region="${{ secrets.AWS_REGION }}" \
+            --set vpcId="${VPC_ID}" \
+            --version 1.8.1 \
+            --wait --timeout 5m
+      - name: Apply Kubernetes manifests
+        run: |
+          IMAGE="${{ needs.build_push.outputs.image }}"
+          if [ -z "$IMAGE" ]; then
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            PROJECT_LOWER=$(echo "${{ secrets.PROJECT_NAME }}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9-]/-/g' \
+              | sed 's/-\{2,\}/-/g' \
+              | sed 's/^-//; s/-$//')
+            IMAGE="${ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${PROJECT_LOWER}:${{ github.sha }}"
+            echo "IMAGE reconstructed: ${IMAGE}"
+          fi
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: Could not resolve container image — aborting"
+            exit 1
+          fi
+          APP_PORT="${{ secrets.APP_PORT }}"
+          APP_PORT="${APP_PORT:-3000}"
+          HEALTH_PATH="/"
+          PROBE_PATH="/"
+          CPU_REQ="250m"
+          MEM_REQ="256Mi"
+          CPU_LIM="500m"
+          MEM_LIM="512Mi"
+          INIT_DELAY="30"
+
+          ENV_SECRET_REF=""
+          if kubectl get secret "${PROJECT_NAME}-env" -n "${NAMESPACE}" > /dev/null 2>&1; then
+            ENV_SECRET_REF="
+            - secretRef:
+                name: ${PROJECT_NAME}-env"
+          fi
+
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${PROJECT_NAME}
+            namespace: ${NAMESPACE}
+            labels:
+              app: ${PROJECT_NAME}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${PROJECT_NAME}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            template:
+              metadata:
+                labels:
+                  app: ${PROJECT_NAME}
+              spec:
+                imagePullSecrets:
+                  - name: ecr-pull-secret
+                containers:
+                  - name: ${PROJECT_NAME}
+                    image: ${IMAGE}
+                    ports:
+                      - containerPort: ${APP_PORT}
+                    envFrom:${ENV_SECRET_REF}
+                    resources:
+                      requests:
+                        cpu: ${CPU_REQ}
+                        memory: ${MEM_REQ}
+                      limits:
+                        cpu: ${CPU_LIM}
+                        memory: ${MEM_LIM}
+                    livenessProbe:
+                      httpGet:
+                        path: ${HEALTH_PATH}
+                        port: ${APP_PORT}
+                      initialDelaySeconds: ${INIT_DELAY}
+                      periodSeconds: 15
+                      failureThreshold: 3
+                    readinessProbe:
+                      httpGet:
+                        path: ${HEALTH_PATH}
+                        port: ${APP_PORT}
+                      initialDelaySeconds: $((INIT_DELAY / 2))
+                      periodSeconds: 10
+                      failureThreshold: 3
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${PROJECT_NAME}
+            namespace: ${NAMESPACE}
+          spec:
+            selector:
+              app: ${PROJECT_NAME}
+            ports:
+              - port: 80
+                targetPort: ${APP_PORT}
+            type: ClusterIP
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${PROJECT_NAME}-ingress
+            namespace: ${NAMESPACE}
+            annotations:
+              kubernetes.io/ingress.class: alb
+              alb.ingress.kubernetes.io/scheme: internet-facing
+              alb.ingress.kubernetes.io/target-type: ip
+              alb.ingress.kubernetes.io/healthcheck-path: ${HEALTH_PATH}
+              alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+              alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+              alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+          spec:
+            rules:
+              - http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: ${PROJECT_NAME}
+                          port:
+                            number: 80
+          EOF
+      - name: Wait for rollout
+        run: |
+          if ! kubectl rollout status deployment/${PROJECT_NAME} \
+               -n "${NAMESPACE}" --timeout=300s; then
+            echo "--- Pod status ---"
+            kubectl get pods -n "${NAMESPACE}" -l app="${PROJECT_NAME}"
+            echo "--- Pod events ---"
+            kubectl describe pods -n "${NAMESPACE}" -l app="${PROJECT_NAME}" | tail -40
+            echo "--- Pod logs (last 50 lines) ---"
+            kubectl logs -n "${NAMESPACE}" -l app="${PROJECT_NAME}" --tail=50 2>/dev/null || true
+            echo "Rollout timed out — continuing to expose URL anyway"
+          fi
+      - name: Get ALB hostname
+        id: ingress
+        run: |
+          echo "Waiting for ALB hostname to be assigned..."
+          for i in $(seq 1 30); do
+            HOSTNAME=$(kubectl get ingress -n "${NAMESPACE}" \
+              -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -n "$HOSTNAME" ]; then
+              echo "url=http://${HOSTNAME}" >> $GITHUB_OUTPUT
+              echo "ALB hostname: ${HOSTNAME}"
+              break
+            fi
+            echo "Attempt ${i}/30 — ALB not ready yet, waiting 20s..."
+            sleep 20
+          done
+          if [ -z "$HOSTNAME" ]; then
+            echo "ALB hostname not assigned within timeout — check AWS console"
+            echo "url=" >> $GITHUB_OUTPUT
+          fi

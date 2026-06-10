@@ -1,0 +1,16 @@
+{
+  "name": "gitlabeks48data",
+  "version": "1.0.0",
+  "private": true,
+  "description": "gitlabeks48data \u2014 Node.js/Express API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "dotenv": "^16.4.7",
+    "pg": "^8.16.3"
+  }
+}
