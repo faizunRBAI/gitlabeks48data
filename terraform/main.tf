@@ -1,6 +1,5 @@
 terraform {
   backend "s3" {
-    key     = "gitlabeks48data/terraform.tfstate"
     encrypt = true
     # bucket and region passed via -backend-config at init time
   }
@@ -132,21 +131,38 @@ variable "spring_mongodb_uri" {
   sensitive = true
 }
 
+variable "rds_db_name" {
+  type    = string
+  default = ""
+}
+
+variable "rds_db_username" {
+  type    = string
+  default = ""
+}
+
+variable "rds_db_password" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
 
 locals {
   name_safe = trimsuffix(substr(lower(replace(replace(var.project_name, "_", "-"), " ", "-")), 0, 24), "-")
   ecr_name  = lower(replace(replace(var.project_name, "_", "-"), " ", "-"))
   namespace = local.name_safe
 
-  _ext_port    = var.db_port != "" ? var.db_port : "5432"
-  _ext_scheme  = "postgresql+asyncpg"
-  _auto_db_url = var.db_host != "" ? "${local._ext_scheme}://${var.db_username}:${var.db_password}@${var.db_host}:${local._ext_port}/${var.db_name}" : ""
+  _rds_db_name = var.rds_db_name != "" ? var.rds_db_name : "${replace(var.project_name, "-", "_")}db"
+  _rds_user    = var.rds_db_username != "" ? var.rds_db_username : "appuser"
+  _rds_port    = "5432"
+  _rds_scheme  = "postgresql+asyncpg"
+  _auto_db_url = "${local._rds_scheme}://${local._rds_user}:${var.rds_db_password}@${aws_db_instance.main.address}:${local._rds_port}/${local._rds_db_name}"
   _db_url      = var.database_url != "" ? var.database_url : local._auto_db_url
-  _db_host     = var.db_host
-  _db_port     = local._ext_port
-  _db_name     = var.db_name
-  _db_user     = var.db_username
-  _db_password = var.db_password
+  _db_host     = aws_db_instance.main.address
+  _db_port     = tostring(aws_db_instance.main.port)
+  _db_name     = local._rds_db_name
+  _db_user     = local._rds_user
+  _db_password = var.rds_db_password
   _spring_ds_url  = var.spring_datasource_url
   _spring_ds_user = var.spring_datasource_user
   _spring_ds_pass = var.spring_datasource_pass
@@ -253,6 +269,46 @@ data "aws_ecr_repository" "app" {
 }
 
 
+# ── RDS (optional managed database) ──────────────────────────────────────────
+resource "aws_db_subnet_group" "main" {
+  name       = "${local.name_safe}-rds-subnet"
+  subnet_ids = module.vpc.private_subnets
+}
+
+resource "aws_security_group" "rds" {
+  name        = "${local.name_safe}-rds-sg"
+  description = "Allow EKS pods to reach RDS"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [module.eks.node_security_group_id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_db_instance" "main" {
+  identifier             = "${local.name_safe}-db"
+  engine                 = "postgres"
+  engine_version         = "16"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  db_name                = local._rds_db_name
+  username               = local._rds_user
+  password               = var.rds_db_password
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+  multi_az               = false
+}
 
 # ── Outputs ────────────────────────────────────────────────────────────────────
 output "cluster_name" {
